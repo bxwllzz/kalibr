@@ -14,6 +14,8 @@ import kalibr_common as kc
 
 import os
 import time
+import threading
+import Queue
 import numpy as np
 import pylab as pl
 import argparse
@@ -23,6 +25,8 @@ import igraph
 
 # make numpy print prettier
 np.set_printoptions(suppress=True)
+
+imshow_queue = Queue.Queue()
 
 class CalibrationTargetDetector(object):
     def __init__(self, camera, targetConfig):
@@ -100,7 +104,7 @@ class CameraChainValidator(object):
             edge["A"][cidx_dest] = self.prepareStereoRectificationMaps(cidx_src, cidx_dest)
                 
         #register the callback for the synchronized images
-        sync_sub = message_filters.TimeSynchronizer([val.image_sub for val in self.monovalidators],1)
+        sync_sub = message_filters.ApproximateTimeSynchronizer([val.image_sub for val in self.monovalidators], 1, 0.1)
         sync_sub.registerCallback(self.synchronizedCallback)
 
         #initialize message throttler
@@ -113,7 +117,7 @@ class CameraChainValidator(object):
         if (timeNow-self.timeLast < 1.0/rate) and self.timeLast!=0:
             return
         self.timeLast = timeNow
-         
+
         #process the images of all cameras
         self.observations=[]; 
         for cam_nr, msg in enumerate(cam_msgs):
@@ -151,8 +155,6 @@ class CameraChainValidator(object):
             cidx_src = edge.source
             cidx_dest = edge.target
             self.generatePairView(cidx_src, cidx_dest)
-                
-        cv2.waitKey(1)
     
     #returns transformation T_to_from
     def getTransformationCamFromTo(self, cidx_from, cidx_to):
@@ -192,7 +194,6 @@ class CameraChainValidator(object):
     def generatePairView(self, camAnr, camBnr):
         #prepare the window
         windowName = "Rectified view (cam{0} and cam{1})".format(camAnr, camBnr)
-        cv2.namedWindow(windowName, 1)
             
         #get the mono validators for each cam
         camA = self.monovalidators[camAnr]
@@ -293,8 +294,9 @@ class CameraChainValidator(object):
         else:
  
             cv2.putText(np_image_rect, "Detection failed...", (np_image_rect.shape[0]/2,np_image_rect.shape[1]/5), cv2.FONT_HERSHEY_SIMPLEX, fontScale=2, color=(0, 0, 255), thickness=3)
-            
-        cv2.imshow(windowName, np_image_rect)
+
+        global imshow_queue
+        imshow_queue.put((windowName, np_image_rect), )
     
     
     def prepareStereoRectificationMaps(self, camAnr, camBnr):        
@@ -378,7 +380,6 @@ class MonoCameraValidator(object):
         
         self.topic = camConfig.getRosTopic()
         self.windowName = "Camera: {0}".format(self.topic)
-        cv2.namedWindow(self.windowName, 1)
     
         #register the cam topic to the message synchronizer
         self.image_sub = message_filters.Subscriber(self.topic, Image)
@@ -453,9 +454,21 @@ class MonoCameraValidator(object):
         else:
             cv2.putText(np_image, "Detection failed...", (np_image.shape[0]/2,np_image.shape[1]/5), cv2.FONT_HERSHEY_SIMPLEX, fontScale=1.5, color=(0, 0, 255), thickness=2)
 
-        cv2.imshow(self.windowName, np_image)
-        cv2.waitKey(1)
+        global imshow_queue
+        imshow_queue.put((self.windowName, np_image), )
 
+def do_imshow():
+    try:
+        while not rospy.is_shutdown():
+            try:
+                global imshow_queue
+                name, img = imshow_queue.get(True, 0.1)
+                cv2.imshow(name, img)
+                cv2.waitKey(1)
+            except Queue.Empty as e:
+                pass
+    finally:
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":        
     parser = argparse.ArgumentParser(description='Validate the intrinsics of a camera.')
@@ -481,9 +494,13 @@ if __name__ == "__main__":
     
     #ros message loops
     rospy.init_node('kalibr_validator', anonymous=True)
+
+    thread_imshow = threading.Thread(target=do_imshow)
+    thread_imshow.start()
+
     try:
         rospy.spin()
     except KeyboardInterrupt:
         print "Shutting down"
-    
-    cv2.destroyAllWindows()
+
+    thread_imshow.join()
